@@ -1,0 +1,22 @@
+data_loader:
+  base_path : dataset_path
+  batch_size : 2
+  num_of_workers : 4
+  augmentations : [] #flip, 
+
+trainer:
+  encoder: vitb
+  max_depth: 80
+  original_weights: vkitti2 weights
+  ckpt_output_path: output save path
+  num_classes: 19
+  max_epochs: 100
+  accelerator: gpu
+  # strategy: "ddp_find_unused_parameters_true" #for training in parallel
+  strategy: 'auto'
+  devices: 1
+  precision: 32
+  sync_batchnorm: True     
+  enable_checkpointing: True
+  visible_devices: '0'
+ 
