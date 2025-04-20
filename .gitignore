@@ -1,6 +1,5 @@
 __pycache__
 assets
-dataset
 eval_depth.py
 eval_shifted_windows.py
 eval_valset.py
@@ -13,3 +12,6 @@ hydra_config/config.yaml
 tb_logs
 test_inference.py
 outputs
+dataset/__pycache__
+dataset/splits
+dataset/c
