@@ -48,7 +48,7 @@ def main(config: DictConfig):
         'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]}
     }
     model = DepthSegmentAnythingV2(**{**model_configs['vitb'], 'max_depth': 80})
-    state_dict = torch.load('/shares/CC_v_Val_FV_Gen3_all/VIDT_DL/data/cnn_training/projects/smart_data_selection/results/Spped_Bump_Search/ckpt-cityscapes/cityscapes_on_depth_metric-vitB_flip_augs_epoch=67-train_loss_epoch=0.08-val_loss_epoch=0.29-train_jaccard_epoch=0.66-val_jaccard_epoch= 0.53.ckpt')
+    state_dict = torch.load('..')
     model.load_state_dict(state_dict['state_dict'], strict=False)
     if torch.cuda.is_available():
         model.cuda()
