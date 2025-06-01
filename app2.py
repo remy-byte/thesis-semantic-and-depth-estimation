@@ -14,7 +14,6 @@ from transform import PrepareForNet, Resize, NormalizeImage
 
 @hydra.main(version_base=None, config_path="hydra_config", config_name="app_config_models")
 def main(config: DictConfig):
-    # Cityscapes 19 classes
     CITYSCAPES_CLASSES = [
         "Road", "Sidewalk", "Building", "Wall", "Fence", "Pole", 
         "Traffic Light", "Traffic Sign", "Vegetation", "Terrain", 
@@ -22,7 +21,6 @@ def main(config: DictConfig):
         "Train", "Motorcycle", "Bicycle"
     ]
 
-    # Image Preprocessing
     def image2tensor(raw_image, input_size=518):
         transform = Compose([
             Resize(
@@ -43,7 +41,6 @@ def main(config: DictConfig):
         DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
         return image.to(DEVICE)
 
-    # Load Model
     model_configs = {
         'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]}
     }
@@ -54,7 +51,6 @@ def main(config: DictConfig):
         model.cuda()
     model.eval()
 
-    # Process image
     def process_image(image):
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         segmentation, depth = model.infer_image(image)
@@ -62,7 +58,6 @@ def main(config: DictConfig):
         segmentation = segmentation.unsqueeze(0).unsqueeze(0)
         segmentation = F.interpolate(segmentation, (1024, 2048), mode="bilinear", align_corners=True)[0, 0]
         segmentation = segmentation.squeeze(0).squeeze(0)
-        # Simulate a point cloud from the depth map (same as before)
         segmentation = segmentation.cpu().detach().numpy()
         segmentation = segmentation.astype(np.uint8)
         return segmentation, depth
@@ -73,7 +68,7 @@ def main(config: DictConfig):
         temp_dir = "temp_images"
         os.makedirs(temp_dir, exist_ok=True)
 
-        target_class = CITYSCAPES_CLASSES.index(selected_class)  # Convert class name to index
+        target_class = CITYSCAPES_CLASSES.index(selected_class) 
 
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(temp_dir)

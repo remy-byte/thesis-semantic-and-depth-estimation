@@ -18,14 +18,13 @@ def main(config: DictConfig):
         'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
     }
     model = DepthSegmentAnythingV2(**{**model_configs['vitb'], 'max_depth': 80})
-    state_metric_depth_seg = config.app.ckptpath  # Replace with actual path
+    state_metric_depth_seg = config.app.ckptpath  
     state_dict = torch.load(state_metric_depth_seg)
     model.load_state_dict(state_dict['state_dict'], strict=False)
     if torch.cuda.is_available():
         model.cuda()
     model.eval()
 
-    # Function to apply color map based on segmentation labels
     def apply_color_map(segmentation, colormap):
         h, w = segmentation.shape
         colored_segmentation = np.zeros((h, w, 3), dtype=np.uint8)
@@ -71,13 +70,11 @@ def main(config: DictConfig):
 
         points = points[z.reshape(-1) > 0]
 
-        # Create Open3D point cloud
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd.colors = o3d.utility.Vector3dVector(colors)
 
 
-        # Save point cloud to file
         o3d.io.write_point_cloud(save_path, pcd)
         
         return save_path
