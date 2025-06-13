@@ -51,7 +51,7 @@ def main(config: DictConfig):
 )
     checkpoint_abs = ModelCheckpoint(
     dirpath=config.trainer.ckpt_output_path,
-    filename='ReduceLRfullsize_1_0.5_5e-5_join_train_ABS_REL-{epoch:02d}-{val_jaccard_epoch:.4f}-{val_abs_rel_epoch:.4f}-{val_rmse_epoch:.4f}-{val_d1_epoch:.4f}-{val_d2_epoch:.4f}-{val_d3_epoch:.4f}',
+    filename='fullsize_1_0.5_5e-5_join_train_ABS_REL-{epoch:02d}-{val_jaccard_epoch:.4f}-{val_abs_rel_epoch:.4f}-{val_rmse_epoch:.4f}-{val_d1_epoch:.4f}-{val_d2_epoch:.4f}-{val_d3_epoch:.4f}',
     save_top_k=1,
     monitor='val_abs_rel',  
     mode='min', 

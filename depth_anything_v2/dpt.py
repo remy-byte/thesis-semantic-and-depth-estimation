@@ -941,3 +941,261 @@ class DepthMetricAnything(pl.LightningModule):
         
         return image, (h, w)
 
+
+from pytorch_lightning.utilities.types import STEP_OUTPUT
+class DepthSegmentAnythingJointV2(pl.LightningModule):
+    def __init__(
+        self,
+        encoder='vits',
+        features=256,
+        num_classes=19,
+        out_channels=[48, 96, 192, 384],
+        use_bn=False,
+        use_clstoken=False,
+        max_depth=80.0,
+        seg_loss_weight=1.0,
+        depth_loss_weight=0.5,
+        optimizer_type="ADAMW",
+        base_lr=5e-5,
+        weight_decay=1e-4,
+        momentum=None,
+        nesterov=False,
+        scheduler_name='PolyLR',
+        max_iters=9296
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        # Segmentation class weights
+        self.class_weights = torch.FloatTensor([
+            0.8373, 0.918, 0.866, 1.0345, 1.0166, 0.9969, 0.9754,
+            1.0489, 0.8786, 1.0023, 0.9539, 0.9843, 1.1116, 0.9037,
+            1.0865, 1.0955, 1.0865, 1.1529, 1.0507
+        ])
+        self.intermediate_layer_idx = {
+            'vits': [2, 5, 8, 11], 'vitb': [2, 5, 8, 11],
+            'vitl': [4, 11, 17, 23], 'vitg': [9, 19, 29, 39]
+        }
+        self.encoder = encoder
+        self.max_depth = max_depth
+        # backbone
+        self.pretrained = DINOv2(model_name=encoder)
+        # heads
+        self.depth_head = DPTHead(
+            self.pretrained.embed_dim, features, use_bn,
+            out_channels=out_channels, use_clstoken=use_clstoken
+        )
+        self.segmentation_head = DPTSegHead(
+            self.pretrained.embed_dim, features,
+            num_classes=num_classes, use_bn=use_bn,
+            out_channels=out_channels, use_clstoken=use_clstoken
+        )
+
+    def load_original_weights_for_training(self, file: str):
+        '''
+        Loading the weights from the original pth that contains only the weights for the original encoder and decoder for depth.
+        Additional step done, by loading the depth weights from the decoder into the segmentation decoder as a form of  "pretraining" 
+        '''
+        # loading the original encoder and decoder of the arhitecture
+        self.state = torch.load(file, map_location= 'cpu')
+        self.load_state_dict(self.state, strict=False)
+
+        # for the segmentation we will also load the same decoder used for depth for the sake of having it "pretrained"
+
+        new_state = {}
+        for param in self.state.keys():
+            new_key = param.replace('depth_head.', '')
+            new_state[new_key] = self.state[param]
+        
+        # taking out the last two conv layers
+        new_state.popitem()
+        new_state.popitem()
+        new_state.popitem()
+
+        for param in self.depth_head.parameters():
+            param.requires_grad = True
+
+        for param in self.segmentation_head.parameters():
+            param.requires_grad = True
+  
+        for param in self.pretrained.parameters(): 
+            param.requires_grad = True
+
+    def configure_optimizers(self):
+        params = self.parameters()
+        if self.hparams.optimizer_type == "SGD":
+            optimizer = optim.SGD(
+                params, lr=self.hparams.base_lr,
+                momentum=self.hparams.momentum,
+                weight_decay=self.hparams.weight_decay,
+                nesterov=self.hparams.nesterov
+            )
+        elif self.hparams.optimizer_type == "ADAM":
+            optimizer = optim.Adam(
+                params, lr=self.hparams.base_lr,
+                weight_decay=self.hparams.weight_decay
+            )
+        else:
+            optimizer = optim.AdamW(
+                params, lr=self.hparams.base_lr,
+                weight_decay=self.hparams.weight_decay
+            )
+        if self.hparams.scheduler_name == "ReduceLRonPlateau":
+            scheduler = ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=5
+            )
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {
+                    'scheduler': scheduler,
+                    'monitor': 'val_loss',
+                    'interval': 'epoch',
+                    'frequency': 1
+                }
+            }
+        return optimizer
+
+    def get_segmentation_loss(self, preds, targets):
+        return F.cross_entropy(
+            preds, targets,
+            weight=self.class_weights.to(self.device),
+            ignore_index=255
+        )
+
+    def get_segmentation_metrics(self, gt, pred):
+        js = MulticlassJaccardIndex(
+            num_classes=self.hparams.num_classes, ignore_index=255
+        ).to(self.device)
+        return js(pred, gt)
+
+    def get_depth_loss(self, pred, target):
+        # mask valid
+        mask = (target >= 0.001) & (target <= self.max_depth)
+        diff_log = torch.log(target[mask]) - torch.log(pred[mask])
+        silog = torch.sqrt(
+            torch.mean(diff_log**2) - 0.5 * torch.mean(diff_log)**2
+        )
+        return silog
+
+    def get_depth_metrics(self, pred, target):
+        mask = (target >= 0.001) & (target <= self.max_depth)
+        pred_m, target_m = pred[mask], target[mask]
+        thresh = torch.max((target_m / pred_m), (pred_m / target_m))
+        d1 = torch.mean((thresh < 1.25).float())
+        d2 = torch.mean((thresh < 1.25**2).float())
+        d3 = torch.mean((thresh < 1.25**3).float())
+        abs_rel = torch.mean(torch.abs(pred_m - target_m) / target_m)
+        sq_rel = torch.mean((pred_m - target_m)**2 / target_m)
+        rmse = torch.sqrt(torch.mean((pred_m - target_m)**2))
+        rmse_log = torch.sqrt(torch.mean((torch.log(pred_m) - torch.log(target_m))**2))
+        log10 = torch.mean(torch.abs(torch.log10(pred_m) - torch.log10(target_m)))
+        return {'d1': d1, 'd2': d2, 'd3': d3,
+                'abs_rel': abs_rel, 'sq_rel': sq_rel,
+                'rmse': rmse, 'rmse_log': rmse_log,
+                'log10': log10}
+
+    def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
+        image, depth_gt, seg_gt = batch
+        seg_pred, depth_pred = self.forward(image)
+        # compute raw losses
+        seg_loss = self.get_segmentation_loss(seg_pred, seg_gt)
+        depth_loss = self.get_depth_loss(depth_pred, depth_gt)
+        # apply weights
+        seg_loss = seg_loss * self.hparams.seg_loss_weight
+        depth_loss = depth_loss * self.hparams.depth_loss_weight
+        # total loss
+        total_loss = seg_loss + depth_loss
+        # metrics
+        seg_metric = self.get_segmentation_metrics(seg_gt, torch.argmax(seg_pred, dim=1))
+        depth_metrics = self.get_depth_metrics(depth_pred, depth_gt)
+        # logging
+        self.log('train_loss', total_loss, prog_bar=True, on_epoch=True,
+                on_step=True, 
+                sync_dist=True )
+        self.log('train_seg_loss', seg_loss,prog_bar=True,  on_epoch=True,
+                on_step=True, 
+                sync_dist=True)
+        self.log('train_depth_loss', depth_loss, prog_bar=True,  on_epoch=True,
+                on_step=True, 
+                sync_dist=True)
+        self.log('train_jaccard', seg_metric, prog_bar=True,  on_epoch=True,
+                on_step=True, 
+                sync_dist=True)
+        for k, v in depth_metrics.items():
+            self.log(f'train_{k}', v, prog_bar=True,  on_epoch=True,
+                on_step=True, 
+                sync_dist=True)
+        return total_loss
+
+    def validation_step(self, batch, batch_idx) -> STEP_OUTPUT:
+        image, depth_gt, seg_gt = batch
+        seg_pred, depth_pred = self.forward(image)
+        seg_loss = self.get_segmentation_loss(seg_pred, seg_gt)
+        depth_loss = self.get_depth_loss(depth_pred, depth_gt)
+        # apply weights
+        seg_loss = seg_loss * self.hparams.seg_loss_weight
+        depth_loss = depth_loss * self.hparams.depth_loss_weight
+        total_loss = seg_loss + depth_loss
+        seg_metric = self.get_segmentation_metrics(seg_gt, torch.argmax(seg_pred, dim=1))
+        depth_metrics = self.get_depth_metrics(depth_pred, depth_gt)
+        self.log('val_loss', total_loss, prog_bar=True, on_epoch=True,
+                on_step=True, 
+                sync_dist=True)
+        self.log('val_seg_loss', seg_loss, prog_bar=True, on_epoch=True,
+                on_step=True, 
+                sync_dist=True)
+        self.log('val_depth_loss', depth_loss, prog_bar=True, on_epoch=True,
+                on_step=True, 
+                sync_dist=True)
+        self.log('val_jaccard', seg_metric, prog_bar=True, on_epoch=True,
+                on_step=True, 
+                sync_dist=True)
+        for k, v in depth_metrics.items():
+            self.log(f'val_{k}', v, prog_bar=True, on_epoch=True,
+                on_step=True, 
+                sync_dist=True)
+        return total_loss
+
+    def forward(self, x):
+        patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
+        feats = self.pretrained.get_intermediate_layers(
+            x, self.intermediate_layer_idx[self.encoder], return_class_token=True
+        )
+        depth = F.relu(self.depth_head(feats, patch_h, patch_w)) * self.max_depth
+        seg = self.segmentation_head(feats, patch_h, patch_w)
+        return seg, depth.squeeze(1)  
+
+    @torch.no_grad()
+    def infer_image(self, raw_image, input_size=518):
+        image, (h, w) = self.image2tensor(raw_image, input_size)
+        
+        segmentation, depth = self.forward(image)
+        
+        depth = F.interpolate(depth[:, None], (h, w), mode="bilinear", align_corners=True)[0, 0]
+        return segmentation, depth.cpu().numpy()
+    
+    def image2tensor(self, raw_image, input_size=518):        
+        transform = Compose([
+            Resize(
+                width=input_size,
+                height=input_size,
+                resize_target=False,
+                keep_aspect_ratio=True,
+                ensure_multiple_of=14,
+                resize_method='lower_bound',
+                image_interpolation_method=cv2.INTER_CUBIC,
+            ),
+            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            PrepareForNet(),
+        ])
+        
+        h, w = raw_image.shape[:2]
+        
+        image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB) / 255.0
+        
+        image = transform({'image': image})['image']
+        image = torch.from_numpy(image).unsqueeze(0)
+        
+        DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+        image = image.to(DEVICE)
+        
+        return image, (h, w)

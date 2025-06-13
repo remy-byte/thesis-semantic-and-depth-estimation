@@ -1,3 +1,7 @@
+# depth_anything_app.py
+# Updated: Filtering logic now retains images where at least 95% of the target‑class pixels
+# fall within the specified depth range.
+
 import os
 import zipfile
 import cv2
@@ -33,11 +37,9 @@ CITYSCAPES_COLORS = [
 ]
 
 # ─── Model Loader ────────────────────────────────────────────────────────────
+
 def load_model_from_config(config: DictConfig):
-    """
-    Instantiate DepthSegmentAnythingV2, load weights from config.app.ckptpath,
-    move to the correct device, and set eval mode.
-    """
+    """Instantiate and load model weights from a Hydra config."""
     global joint_model
     model_configs = {
         'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
@@ -51,12 +53,8 @@ def load_model_from_config(config: DictConfig):
     joint_model.eval()
 
 # ─── Preprocessing ───────────────────────────────────────────────────────────
+
 def image2tensor(raw_image: np.ndarray, input_size: int = 518):
-    """
-    Preprocess a raw RGB image (uint8) for the network:
-    1) Resize / pad / normalize / convert to tensor
-    Returns: (tensor on cuda/cpu), (orig H, orig W).
-    """
     transform = Compose([
         Resize(width=input_size, height=input_size, resize_target=False,
                keep_aspect_ratio=True, ensure_multiple_of=14,
@@ -71,32 +69,24 @@ def image2tensor(raw_image: np.ndarray, input_size: int = 518):
     return tensor.to(device), raw_image.shape[:2]
 
 # ─── Visualization Helpers ───────────────────────────────────────────────────
+
 def apply_color_map(segmentation: np.ndarray, colormap: list):
-    """
-    Map a 2D segmentation array (H×W) with labels 0–18 to an RGB image (uint8) via colormap.
-    """
     h, w = segmentation.shape
     colored = np.zeros((h, w, 3), dtype=np.uint8)
     for label, color in enumerate(colormap):
         colored[segmentation == label] = color
     return colored
 
+
 def apply_colormap_to_depth(depth: np.ndarray, cmap_name: str = 'plasma'):
-    """
-    Normalize a depth map (float32) to [0–1], apply a Matplotlib colormap,
-    and return a uint8 RGB image.
-    """
     depth_np = depth.astype(np.float32)
     norm = (depth_np - np.min(depth_np)) / ((np.max(depth_np) - np.min(depth_np)) + 1e-6)
     colormap = cm.get_cmap(cmap_name)
     colored = colormap(norm)[:, :, :3]
     return (colored * 255).astype(np.uint8)
 
+
 def create_point_cloud(depth_map: np.ndarray, rgb_colors: np.ndarray, save_path: str):
-    """
-    Project each pixel in depth_map into 3D using fixed intrinsics,
-    color with rgb_colors (which must match depth_map resolution), and write a PLY at save_path.
-    """
     h, w = depth_map.shape
     f_x, f_y = 2262.52, 2265.30
     c_x, c_y = 1024, 512
@@ -119,51 +109,28 @@ def create_point_cloud(depth_map: np.ndarray, rgb_colors: np.ndarray, save_path:
     return save_path
 
 # ─── Core Inference Helpers ──────────────────────────────────────────────────
+
 def generate_depth_and_segmentation(image: np.ndarray):
-    """
-    Run a single RGB image (H×W×3, uint8) through joint_model:
-      1) Compute a 1024×2048 segmentation mask, color it.
-      2) Compute a depth map, color it with plasma colormap.
-      3) Create two point clouds (segmentation-colored & raw RGB).
-    Returns:
-      - seg_rgb (float in [0,1], H×W×3)
-      - depth_rgb (float in [0,1], H×W×3)
-      - seg_ply_path (string)
-      - raw_ply_path (string)
-    """
+    """Run model on RGB image and return segmentation, depth, and two point clouds."""
     global joint_model
     image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     seg_logits, depth_tensor = joint_model.infer_image(image_bgr)
 
-    # 1) Build a 1024×2048 label map from seg_logits
     segmentation = torch.argmax(seg_logits, dim=1).float()
     segmentation = F.interpolate(
         segmentation.unsqueeze(1),
         (1024, 2048),
         mode="nearest"
-    )[0, 0]  # shape: (1024, 2048)
+    )[0, 0]
     seg_map_np = segmentation.cpu().numpy().astype(np.uint8)
     colored_seg = apply_color_map(seg_map_np, CITYSCAPES_COLORS)
 
-    # 2) Convert depth tensor to NumPy then colorize
     depth_np = depth_tensor.squeeze().astype(np.float32)
     depth_colored = apply_colormap_to_depth(depth_np)
 
-    # 3) Resize original RGB to match depth resolution (H×W → same as depth_np)
-    resized_rgb = cv2.resize(
-        image,
-        (depth_np.shape[1], depth_np.shape[0]),
-        interpolation=cv2.INTER_LINEAR
-    )
+    resized_rgb = cv2.resize(image, (depth_np.shape[1], depth_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+    seg_resized_for_pcd = cv2.resize(colored_seg, (depth_np.shape[1], depth_np.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-    # 4) Resize the 1024×2048 colored_seg → (depth_H, depth_W) for point cloud
-    seg_resized_for_pcd = cv2.resize(
-        colored_seg,
-        (depth_np.shape[1], depth_np.shape[0]),
-        interpolation=cv2.INTER_NEAREST
-    )
-
-    # 5) Create & save point clouds, now shapes match:
     seg_ply = create_point_cloud(depth_np, seg_resized_for_pcd, "/tmp/seg_pointcloud.ply")
     raw_ply = create_point_cloud(depth_np, resized_rgb, "/tmp/raw_pointcloud.ply")
 
@@ -174,13 +141,9 @@ def generate_depth_and_segmentation(image: np.ndarray):
         raw_ply
     )
 
+
 def process_image(image: np.ndarray):
-    """
-    Run joint_model.infer_image on a single RGB→BGR image:
-      Returns:
-        - seg_map (1024×2048, uint8)
-        - depth_map (H×W, float32)
-    """
+    """Return segmentation map and depth map for a single image."""
     global joint_model
     image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     seg_logits, depth_tensor = joint_model.infer_image(image_bgr)
@@ -196,72 +159,81 @@ def process_image(image: np.ndarray):
     depth_map = depth_tensor.squeeze()
     return seg_map, depth_map
 
+# ─── UPDATED Filtering Helper ────────────────────────────────────────────────
+
 def filter_images(zip_path: str, selected_class: str, min_depth: float, max_depth: float):
-    """
-    Given a ZIP of images:
-      1) Unzip to /tmp/temp_images
-      2) For each image, run process_image()
-      3) Resize the returned depth_map (H×W) → (1024×2048) using nearest
-      4) Build a mask where (seg_map == target_class_idx) AND (depth_resized in [min_depth, max_depth])
-      5) Keep images if mask has ≥ 100 True pixels, pack them into /tmp/filtered_output.zip.
-    Returns the output ZIP path or None if no matches.
+    """Filter a ZIP archive of images.
+
+    An image is *kept* if **at least 95% of the pixels belonging to the selected
+    semantic class** also have depth values within the user‑defined range
+    (`min_depth` ≤ depth ≤ `max_depth`).
     """
     output_zip = "/tmp/filtered_output.zip"
     temp_dir = "/tmp/temp_images"
 
-    # Clean and recreate temp_dir
     if os.path.isdir(temp_dir):
         shutil.rmtree(temp_dir)
     os.makedirs(temp_dir, exist_ok=True)
 
     target_idx = CITYSCAPES_CLASSES.index(selected_class)
+    log_lines = []
+    valid_images = []
 
+    # Extract all images first so that we can iterate easily.
     with zipfile.ZipFile(zip_path, "r") as zip_ref:
         zip_ref.extractall(temp_dir)
 
-    valid_images = []
     for root, _, files in os.walk(temp_dir):
-        for filename in files:
+        for filename in sorted(files):
             img_path = os.path.join(root, filename)
             img = cv2.imread(img_path)
             if img is None:
-                continue
+                continue  # Skip non‑image files or failed reads.
 
             seg_map, depth_map = process_image(img)
-            # Resize depth_map → (1024×2048):
-            depth_resized = cv2.resize(
-                depth_map,
-                (seg_map.shape[1], seg_map.shape[0]),
-                interpolation=cv2.INTER_NEAREST
-            )
-            # Build mask
-            mask = (seg_map == target_idx) & (depth_resized >= min_depth) & (depth_resized <= max_depth)
-            if np.count_nonzero(mask) >= 100:
+            # Resize depth map to match segmentation map for pixelwise checks.
+            depth_resized = cv2.resize(depth_map, (seg_map.shape[1], seg_map.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+            # Identify all pixels of selected class.
+            class_mask = seg_map == target_idx
+            total_class_pixels = int(np.count_nonzero(class_mask))
+
+            if total_class_pixels == 0:
+                log_lines.append(f"Bad. {filename} (class not present)")
+                continue
+
+            # Of those pixels, how many are within the depth range?
+            depth_range_mask = (depth_resized >= min_depth) & (depth_resized <= max_depth)
+            in_range_mask = class_mask & depth_range_mask
+            in_range_pixels = int(np.count_nonzero(in_range_mask))
+
+            ratio = in_range_pixels / total_class_pixels
+
+            if ratio >= 0.55:
                 valid_images.append(img_path)
+                log_lines.append(f"Good! {filename} ({ratio:.2%} of class pixels in range)")
+            else:
+                log_lines.append(f"Bad. {filename} ({ratio:.2%} of class pixels in range)")
 
     if valid_images:
         with zipfile.ZipFile(output_zip, "w") as zip_out:
             for img in valid_images:
                 zip_out.write(img, os.path.basename(img))
-        return output_zip
+        return output_zip, "\n".join(log_lines)
     else:
-        return None
+        return None, "\n".join(log_lines)
+
+# ─── Gradio Glue Code ────────────────────────────────────────────────────────
 
 def gradio_pipeline(zip_file, selected_class, min_depth, max_depth):
-    """
-    Gradio wrapper: takes an uploaded ZIP file, calls filter_images,
-    and returns either the filtered ZIP path or a “No valid images found.” string.
-    """
-    filtered = filter_images(zip_file.name, selected_class, min_depth, max_depth)
-    return filtered if filtered else "No valid images found."
+    filtered_zip, log = filter_images(zip_file.name, selected_class, min_depth, max_depth)
+    return (filtered_zip if filtered_zip else None), log
 
-# ─── Hydra Entry Point ───────────────────────────────────────────────────────
+
 @hydra.main(version_base=None, config_path="hydra_config", config_name="app_config_models")
 def main(config: DictConfig):
-    # 1) Load the model into the global joint_model
     load_model_from_config(config)
 
-    # 2) Build Gradio interfaces
     tab1 = gr.Interface(
         fn=generate_depth_and_segmentation,
         inputs=gr.Image(type="numpy", label="Upload Image"),
@@ -283,15 +255,16 @@ def main(config: DictConfig):
             gr.Slider(0, 80, value=5, step=1, label="Min Depth"),
             gr.Slider(0, 80, value=50, step=1, label="Max Depth"),
         ],
-        outputs=gr.File(label="Filtered ZIP"),
+        outputs=[
+            gr.File(label="Filtered ZIP"),
+            gr.Textbox(label="Filtering Log", lines=20, interactive=False)
+        ],
         title="Filter Images by Class & Depth",
-        description="Filter a ZIP of images to only include ones with selected class and depth range."
+        description="Filter a ZIP of images to only include ones with selected class and depth range. Shows filtering log."
     )
 
-    # 3) Launch all tabs
-    gr.TabbedInterface([tab1, tab2], ["Depth & Segmentation", "ZIP Image Filter"]).launch(
-        server_name="0.0.0.0", server_port=7860, share=True
-    )
+    gr.TabbedInterface([tab1, tab2], ["Depth & Segmentation", "ZIP Filtering"]).launch(server_name="0.0.0.0", server_port=7860, share=True)
+
 
 if __name__ == '__main__':
     main()
